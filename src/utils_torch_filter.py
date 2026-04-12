@@ -460,7 +460,17 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         path_iekf = os.path.join(args.path_temp, "iekfnets.p")
         if os.path.isfile(path_iekf):
             mondict = torch.load(path_iekf)
-            self.load_state_dict(mondict)
+
+            w = mondict['mes_net.cov_net.4.weight']
+            b = mondict['mes_net.cov_net.4.bias']
+
+            w32 = .5 * (w[0::2] + w[1::2])
+            b32 = .5 * (b[0::2] + b[1::2])
+
+            mondict['mes_net.cov_net.4.weight'] = w32.clone()
+            mondict['mes_net.cov_net.4.bias'] = b32.clone()
+
+            self.load_state_dict(mondict, strict=False)
             cprint("IEKF nets loaded", 'green')
         else:
             cprint("IEKF nets NOT loaded", 'yellow')
