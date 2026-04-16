@@ -5,3 +5,5 @@ temp/iekfnets.p
 temp/normalize_factors.p
 src/__pycache__
 .venv/
+.python-version
+env/
