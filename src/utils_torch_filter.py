@@ -7,6 +7,8 @@ from termcolor import cprint
 from utils_numpy_filter import NUMPYIEKF
 from utils import prepare_data
 
+from quantization import quantize_weights
+
 class InitProcessCovNet(torch.nn.Module):
 
         def __init__(self):
@@ -472,6 +474,14 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
 
             self.load_state_dict(mondict, strict=False)
             cprint("IEKF nets loaded", 'green')
+
+            quantize_weights(
+                [
+                    self.mes_net.cov_net[0],
+                    self.mes_net.cov_net[4],
+                    self.mes_net.cov_lin[0],
+                ]
+            )
         else:
             cprint("IEKF nets NOT loaded", 'yellow')
         self.get_normalize_u(dataset)

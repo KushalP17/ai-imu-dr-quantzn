@@ -79,3 +79,11 @@ def linear_quantize_weight_per_channel(tensor, bitwidth):
 
     quantized_tensor = linear_quantize(tensor, bitwidth, scale, zero_point=0)
     return quantized_tensor, scale, 0
+
+
+def quantize_weights(layers, bitwidth=8):
+    for layer in layers:
+        quantized_weight, _, _ = linear_quantize_weight_per_channel(
+            layer.weight.data.to(torch.float), bitwidth
+        )
+        # TODO write the quantized weights back into layers
