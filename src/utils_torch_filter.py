@@ -488,7 +488,7 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                     if self.mes_net.cov_net[0].bias is not None
                     else None
                 ),
-                weight_scale=layers[0][1].squeeze(),
+                weight_scale=layers[0][1],
                 stride=self.mes_net.cov_net[0].stride,
                 padding=self.mes_net.cov_net[0].padding,
                 dilation=self.mes_net.cov_net[0].dilation,
@@ -501,7 +501,7 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                     if self.mes_net.cov_net[4].bias is not None
                     else None
                 ),
-                weight_scale=layers[1][1].squeeze(),
+                weight_scale=layers[1][1],
                 stride=self.mes_net.cov_net[4].stride,
                 padding=self.mes_net.cov_net[4].padding,
                 dilation=self.mes_net.cov_net[4].dilation,
@@ -514,10 +514,9 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                     if self.mes_net.cov_lin[0].bias is not None
                     else None
                 ),
-                weight_scale=layers[2][1].squeeze(),
+                weight_scale=layers[2][1],
             )
             cprint("IEKF nets quantized", "green")
-            breakpoint() # TODO remove
         else:
             cprint("IEKF nets NOT loaded", 'yellow')
         self.get_normalize_u(dataset)

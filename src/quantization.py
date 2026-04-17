@@ -114,8 +114,17 @@ class QuantizedConv1d(nn.Module):
         self.weight_bitwidth = weight_bitwidth
 
     def forward(self, x):
-        # TODO
-        return 0
+        # TODO replace with int8 math
+        weight_fp = self.weight.double() * self.weight_scale
+        return nn.functional.conv1d(
+            x,
+            weight_fp,
+            self.bias.double(),
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
 
 
 class QuantizedLinear(nn.Module):
@@ -126,5 +135,6 @@ class QuantizedLinear(nn.Module):
         self.register_buffer("weight_scale", weight_scale)
 
     def forward(self, x):
-        # TODO
-        return 0
+        # TODO replace with int8 math
+        weight_fp = self.weight.double() * self.weight_scale
+        return nn.functional.linear(x, weight_fp, self.bias.double())
