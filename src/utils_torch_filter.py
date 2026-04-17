@@ -7,7 +7,7 @@ from termcolor import cprint
 from utils_numpy_filter import NUMPYIEKF
 from utils import prepare_data
 
-from quantization import quantize_weights
+from quantization import quantize_weights, QuantizedConv1d, QuantizedLinear
 
 class InitProcessCovNet(torch.nn.Module):
 
@@ -233,7 +233,6 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         Rot_up, v_up, p_up, b_omega_up, b_acc_up, Rot_c_i_up, t_c_i_up, P_up = \
             self.state_and_cov_update(Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P, H, r, R)
         return Rot_up, v_up, p_up, b_omega_up, b_acc_up, Rot_c_i_up, t_c_i_up, P_up
-
 
     @staticmethod
     def state_and_cov_update(Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P, H, r, R):
@@ -475,13 +474,50 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
             self.load_state_dict(mondict, strict=False)
             cprint("IEKF nets loaded", 'green')
 
-            quantize_weights(
+            layers = quantize_weights(
                 [
                     self.mes_net.cov_net[0],
                     self.mes_net.cov_net[4],
                     self.mes_net.cov_lin[0],
                 ]
             )
+            self.mes_net.cov_net[0] = QuantizedConv1d(
+                weight=layers[0][0],
+                bias=(
+                    self.mes_net.cov_net[0].bias.data.float()
+                    if self.mes_net.cov_net[0].bias is not None
+                    else None
+                ),
+                weight_scale=layers[0][1].squeeze(),
+                stride=self.mes_net.cov_net[0].stride,
+                padding=self.mes_net.cov_net[0].padding,
+                dilation=self.mes_net.cov_net[0].dilation,
+                groups=self.mes_net.cov_net[0].groups,
+            )
+            self.mes_net.cov_net[4] = QuantizedConv1d(
+                weight=layers[1][0],
+                bias=(
+                    self.mes_net.cov_net[4].bias.data.float()
+                    if self.mes_net.cov_net[4].bias is not None
+                    else None
+                ),
+                weight_scale=layers[1][1].squeeze(),
+                stride=self.mes_net.cov_net[4].stride,
+                padding=self.mes_net.cov_net[4].padding,
+                dilation=self.mes_net.cov_net[4].dilation,
+                groups=self.mes_net.cov_net[4].groups,
+            )
+            self.mes_net.cov_lin[0] = QuantizedLinear(
+                weight=layers[2][0],
+                bias=(
+                    self.mes_net.cov_lin[0].bias.data.float()
+                    if self.mes_net.cov_lin[0].bias is not None
+                    else None
+                ),
+                weight_scale=layers[2][1].squeeze(),
+            )
+            cprint("IEKF nets quantized", "green")
+            breakpoint() # TODO remove
         else:
             cprint("IEKF nets NOT loaded", 'yellow')
         self.get_normalize_u(dataset)

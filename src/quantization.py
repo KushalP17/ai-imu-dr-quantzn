@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 
 def get_quantized_range(bitwidth):
@@ -82,8 +83,48 @@ def linear_quantize_weight_per_channel(tensor, bitwidth):
 
 
 def quantize_weights(layers, bitwidth=8):
-    for layer in layers:
-        quantized_weight, _, _ = linear_quantize_weight_per_channel(
+    quantized_layers = [None] * len(layers)
+    for i, layer in enumerate(layers):
+        quantized_layers[i] = linear_quantize_weight_per_channel(
             layer.weight.data.to(torch.float), bitwidth
         )
-        # TODO write the quantized weights back into layers
+    return quantized_layers
+
+
+class QuantizedConv1d(nn.Module):
+    def __init__(
+        self,
+        weight,
+        bias,
+        weight_scale,
+        stride,
+        padding,
+        dilation,
+        groups,
+        weight_bitwidth=8,
+    ):
+        super().__init__()
+        self.register_buffer("weight", weight)
+        self.register_buffer("bias", bias)
+        self.register_buffer("weight_scale", weight_scale)
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.weight_bitwidth = weight_bitwidth
+
+    def forward(self, x):
+        # TODO
+        return 0
+
+
+class QuantizedLinear(nn.Module):
+    def __init__(self, weight, bias, weight_scale):
+        super().__init__()
+        self.register_buffer("weight", weight)
+        self.register_buffer("bias", bias)
+        self.register_buffer("weight_scale", weight_scale)
+
+    def forward(self, x):
+        # TODO
+        return 0
