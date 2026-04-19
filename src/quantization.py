@@ -359,3 +359,14 @@ class QuantizedLinear(nn.Module):
     def forward(self, x):
         # TODO
         return 0
+
+
+class DequantizeTanh(nn.Module):
+    def __init__(self, scale, zero_point):
+        super().__init__()
+        self.scale = scale
+        self.zero_point = zero_point
+
+    def forward(self, x):
+        x_float = (x.float() - self.zero_point) * self.scale
+        return torch.tanh(x_float)

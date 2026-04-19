@@ -7,7 +7,12 @@ from termcolor import cprint
 from utils_numpy_filter import NUMPYIEKF
 from utils import prepare_data
 
-from quantization import  QuantizedConv1d, QuantizedLinear, record_activation_range
+from quantization import (
+    QuantizedConv1d,
+    QuantizedLinear,
+    DequantizeTanh,
+    record_activation_range,
+)
 
 REPLICATION_PAD_SIZE = 4
 
@@ -524,11 +529,10 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                 input_activation,
                 output_activation,
             )
+            tahn_1 = DequantizeTanh(linear_0.output_scale, linear_0.output_zero_point)
 
             self.mes_net.cov_net = torch.nn.Sequential(conv_0, conv_4)
-            self.mes_net.cov_lin = torch.nn.Sequential(linear_0)  # TODO dequantize Tahn
-
-            breakpoint()
+            self.mes_net.cov_lin = torch.nn.Sequential(linear_0, tahn_1)
 
             cprint("IEKF nets quantized", "green")
         else:
