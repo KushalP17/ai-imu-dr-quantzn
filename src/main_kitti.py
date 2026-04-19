@@ -1,3 +1,4 @@
+import argparse
 import os
 import shutil
 import numpy as np
@@ -473,12 +474,23 @@ class KITTIArgs():
         train_filter = 0
         test_filter = 1
         results_filter = 1
+        quantize = False
         dataset_class = KITTIDataset
         parameter_class = KITTIParameters
 
 
 if __name__ == '__main__':
-    args = KITTIArgs()
-    dataset = KITTIDataset(args)
-    launch(KITTIArgs)
+    parser = argparse.ArgumentParser(description="AI-IMU Dead-Reckoning")
+    parser.add_argument(
+        "-q",
+        "--quantize",
+        action="store_true",
+        help="use quantized model in filter test",
+    )
+    parser_args = parser.parse_args()
 
+    dataset = KITTIDataset(KITTIArgs())
+
+    args = KITTIArgs()
+    args.quantize = parser_args.quantize
+    launch(args)
