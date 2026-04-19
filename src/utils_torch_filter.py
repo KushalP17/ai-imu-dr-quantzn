@@ -514,6 +514,7 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                 input_activation,
                 output_activation,
                 pad_size=REPLICATION_PAD_SIZE,
+                first_layer=True,
             )
             conv_4 = QuantizedConv1d.build(
                 self.mes_net.cov_net[4],

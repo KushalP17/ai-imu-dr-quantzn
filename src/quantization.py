@@ -140,7 +140,7 @@ def linear_quantize_bias_per_output_channel(bias, weight_scale, input_scale):
 
 def shift_quantized_conv1d_bias(quantized_bias, quantized_weight, input_zero_point):
     """
-    shift quantized bias to incorporate input_zero_point for nn.Conv2d
+    shift quantized bias to incorporate input_zero_point for nn.Conv1d
         shifted_quantized_bias = quantized_bias - Conv(input_zero_point, quantized_weight)
     :param quantized_bias: [torch.IntTensor] quantized bias (torch.int32)
     :param quantized_weight: [torch.CharTensor] quantized weight (torch.int8)
@@ -168,6 +168,137 @@ def shift_quantized_linear_bias(quantized_bias, quantized_weight, input_zero_poi
     assert quantized_bias.dtype == torch.int32
     assert isinstance(input_zero_point, int)
     return quantized_bias - quantized_weight.sum(1).to(torch.int32) * input_zero_point
+
+
+def quantized_conv1d(
+    input,
+    weight,
+    bias,
+    feature_bitwidth,
+    weight_bitwidth,
+    input_zero_point,
+    output_zero_point,
+    input_scale,
+    weight_scale,
+    output_scale,
+    stride,
+    padding,
+    dilation,
+    groups,
+):
+    """
+    quantized 1d convolution
+    :param input: [torch.CharTensor] quantized input (torch.int8)
+    :param weight: [torch.CharTensor] quantized weight (torch.int8)
+    :param bias: [torch.IntTensor] shifted quantized bias or None (torch.int32)
+    :param feature_bitwidth: [int] quantization bit width of input and output
+    :param weight_bitwidth: [int] quantization bit width of weight
+    :param input_zero_point: [int] input zero point
+    :param output_zero_point: [int] output zero point
+    :param input_scale: [float] input feature scale
+    :param weight_scale: [torch.FloatTensor] weight per-channel scale
+    :param output_scale: [float] output feature scale
+    :return:
+        [torch.(cuda.)CharTensor] quantized output feature
+    """
+    assert input.dtype == torch.int8
+    assert weight.dtype == input.dtype
+    assert bias is None or bias.dtype == torch.int32
+    assert isinstance(input_zero_point, int)
+    assert isinstance(output_zero_point, int)
+    assert isinstance(input_scale, float)
+    assert isinstance(output_scale, float)
+    assert weight_scale.dtype == torch.float
+
+    # Step 1: calculate integer-based 1d convolution (8-bit multiplication with 32-bit accumulation)
+    if "cpu" in input.device.type and all(d == 1 for d in dilation):
+        # use 32-b MAC for simplicity
+        output = torch.nn.functional.conv1d(
+            input.to(torch.int32),
+            weight.to(torch.int32),
+            None,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )
+    else:
+        # current version pytorch does not yet support integer-based conv1d() on GPUs or conv1d() when dilation is greater than 1
+        output = torch.nn.functional.conv1d(
+            input.float(), weight.float(), None, stride, padding, dilation, groups
+        )
+        output = output.round().to(torch.int32)
+    if bias is not None:
+        output = output + bias.view(1, -1, 1)
+
+    # Step 2: scale the output
+    output = output.float() * (
+        (input_scale * weight_scale.view(1, weight_scale.shape[0], 1)) / output_scale
+    )
+
+    # Step 3: shift output by output_zero_point
+    output += output_zero_point
+
+    # Make sure all value lies in the bitwidth-bit range
+    output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(torch.int8)
+    return output
+
+
+def quantized_linear(
+    input,
+    weight,
+    bias,
+    feature_bitwidth,
+    weight_bitwidth,
+    input_zero_point,
+    output_zero_point,
+    input_scale,
+    weight_scale,
+    output_scale,
+):
+    """
+    quantized fully-connected layer
+    :param input: [torch.CharTensor] quantized input (torch.int8)
+    :param weight: [torch.CharTensor] quantized weight (torch.int8)
+    :param bias: [torch.IntTensor] shifted quantized bias or None (torch.int32)
+    :param feature_bitwidth: [int] quantization bit width of input and output
+    :param weight_bitwidth: [int] quantization bit width of weight
+    :param input_zero_point: [int] input zero point
+    :param output_zero_point: [int] output zero point
+    :param input_scale: [float] input feature scale
+    :param weight_scale: [torch.FloatTensor] weight per-channel scale
+    :param output_scale: [float] output feature scale
+    :return:
+        [torch.CharIntTensor] quantized output feature (torch.int8)
+    """
+    assert input.dtype == torch.int8
+    assert weight.dtype == input.dtype
+    assert bias is None or bias.dtype == torch.int32
+    assert isinstance(input_zero_point, int)
+    assert isinstance(output_zero_point, int)
+    assert isinstance(input_scale, float)
+    assert isinstance(output_scale, float)
+    assert weight_scale.dtype == torch.float
+
+    # Step 1: integer-based fully-connected (8-bit multiplication with 32-bit accumulation)
+    if "cpu" in input.device.type:
+        # use 32-b MAC for simplicity
+        output = torch.nn.functional.linear(
+            input.to(torch.int32), weight.to(torch.int32), bias
+        )
+    else:
+        # current version pytorch does not yet support integer-based linear() on GPUs
+        output = torch.nn.functional.linear(input.float(), weight.float(), bias.float())
+
+    # Step 2: scale the output
+    output = output.float() * ((input_scale * weight_scale.view(1, -1)) / output_scale)
+
+    # Step 3: shift output by output_zero_point
+    output += output_zero_point
+
+    # Make sure all value lies in the bitwidth-bit range
+    output = output.round().clamp(*get_quantized_range(feature_bitwidth)).to(torch.int8)
+    return output
 
 
 def record_activation_range(model, sample_function, sample_data):
@@ -218,6 +349,7 @@ class QuantizedConv1d(nn.Module):
         pad_size=0,
         feature_bitwidth=DEFAULT_BITWIDTH,
         weight_bitwidth=DEFAULT_BITWIDTH,
+        first_layer=False,
     ):
         super().__init__()
         self.register_buffer("weight", weight)
@@ -237,6 +369,7 @@ class QuantizedConv1d(nn.Module):
 
         self.feature_bitwidth = feature_bitwidth
         self.weight_bitwidth = weight_bitwidth
+        self.first_layer = first_layer
 
         if pad_size > 0:
             self.pad = nn.ReplicationPad1d(pad_size)
@@ -252,6 +385,7 @@ class QuantizedConv1d(nn.Module):
         pad_size,
         feature_bitwidth=DEFAULT_BITWIDTH,
         weight_bitwidth=DEFAULT_BITWIDTH,
+        first_layer=False,
     ):
         input_scale, input_zero_point = get_quantization_scale_and_zero_point(
             input_activation[conv_layer_name], feature_bitwidth
@@ -284,11 +418,31 @@ class QuantizedConv1d(nn.Module):
             pad_size=pad_size,
             feature_bitwidth=feature_bitwidth,
             weight_bitwidth=weight_bitwidth,
+            first_layer=first_layer,
         )
 
     def forward(self, x):
-        # TODO
-        return 0
+        if self.first_layer:
+            x = linear_quantize(
+                x, self.feature_bitwidth, self.input_scale, self.input_zero_point
+            )
+        x = self.pad(x)
+        return quantized_conv1d(
+            x,
+            self.weight,
+            self.bias,
+            self.feature_bitwidth,
+            self.weight_bitwidth,
+            self.input_zero_point,
+            self.output_zero_point,
+            self.input_scale,
+            self.weight_scale,
+            self.output_scale,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
 
 
 class QuantizedLinear(nn.Module):
@@ -303,6 +457,7 @@ class QuantizedLinear(nn.Module):
         output_scale,
         feature_bitwidth=DEFAULT_BITWIDTH,
         weight_bitwidth=DEFAULT_BITWIDTH,
+        first_layer=False,
     ):
         super().__init__()
         self.register_buffer("weight", weight)
@@ -317,6 +472,7 @@ class QuantizedLinear(nn.Module):
 
         self.feature_bitwidth = feature_bitwidth
         self.weight_bitwidth = weight_bitwidth
+        self.first_layer = first_layer
 
     @classmethod
     def build(
@@ -327,6 +483,7 @@ class QuantizedLinear(nn.Module):
         output_activation,
         feature_bitwidth=DEFAULT_BITWIDTH,
         weight_bitwidth=DEFAULT_BITWIDTH,
+        first_layer=False,
     ):
         input_scale, input_zero_point = get_quantization_scale_and_zero_point(
             input_activation[linear_layer_name], feature_bitwidth
@@ -354,11 +511,26 @@ class QuantizedLinear(nn.Module):
             output_scale,
             feature_bitwidth=feature_bitwidth,
             weight_bitwidth=weight_bitwidth,
+            first_layer=first_layer,
         )
 
     def forward(self, x):
-        # TODO
-        return 0
+        if self.first_layer:
+            x = linear_quantize(
+                x, self.feature_bitwidth, self.input_scale, self.input_zero_point
+            )
+        return quantized_linear(
+            x,
+            self.weight,
+            self.bias,
+            self.feature_bitwidth,
+            self.weight_bitwidth,
+            self.input_zero_point,
+            self.output_zero_point,
+            self.input_scale,
+            self.weight_scale,
+            self.output_scale,
+        )
 
 
 class DequantizeTanh(nn.Module):
