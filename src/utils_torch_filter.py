@@ -7,12 +7,10 @@ from termcolor import cprint
 from utils_numpy_filter import NUMPYIEKF
 from utils import prepare_data
 
-from quantization import (
-    QuantizedConv1d,
-    QuantizedLinear,
-    quantize_weights,
-    record_activation_range,
-)
+from quantization import  QuantizedConv1d, QuantizedLinear, record_activation_range
+
+REPLICATION_PAD_SIZE = 4
+
 
 class InitProcessCovNet(torch.nn.Module):
 
@@ -52,11 +50,11 @@ class MesNet(torch.nn.Module):
             self.tanh = torch.nn.Tanh()
 
             self.cov_net = torch.nn.Sequential(torch.nn.Conv1d(6, 32, 5),
-                       torch.nn.ReplicationPad1d(4),
+                       torch.nn.ReplicationPad1d(REPLICATION_PAD_SIZE),
                        torch.nn.ReLU(),
                        torch.nn.Dropout(p=0.5),
                        torch.nn.Conv1d(32, 32, 5, dilation=3),
-                       torch.nn.ReplicationPad1d(4),
+                       torch.nn.ReplicationPad1d(REPLICATION_PAD_SIZE),
                        torch.nn.ReLU(),
                        torch.nn.Dropout(p=0.5),
                        ).double()
@@ -468,81 +466,74 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         if os.path.isfile(path_iekf):
             mondict = torch.load(path_iekf)
 
-            w = mondict['mes_net.cov_net.4.weight']
-            b = mondict['mes_net.cov_net.4.bias']
+            w = mondict["mes_net.cov_net.4.weight"]
+            b = mondict["mes_net.cov_net.4.bias"]
 
-            w32 = .5 * (w[0::2] + w[1::2])
-            b32 = .5 * (b[0::2] + b[1::2])
+            w32 = 0.5 * (w[0::2] + w[1::2])
+            b32 = 0.5 * (b[0::2] + b[1::2])
 
-            mondict['mes_net.cov_net.4.weight'] = w32.clone()
-            mondict['mes_net.cov_net.4.bias'] = b32.clone()
+            mondict["mes_net.cov_net.4.weight"] = w32.clone()
+            mondict["mes_net.cov_net.4.bias"] = b32.clone()
 
             self.load_state_dict(mondict, strict=False)
-            cprint("IEKF nets loaded", 'green')
+            cprint("IEKF nets loaded", "green")
 
-            input_activation = {}
-            output_activation = {}
-            for i in range(0, len(dataset.datasets)):
-                dataset_name = dataset.dataset_name(i)
-                if dataset_name not in dataset.odometry_benchmark.keys():
-                    continue
-                print("Recoding activation range on sequence: " + dataset_name)
-                _, _, _, _, u = prepare_data(
-                    args, dataset, dataset_name, i, to_numpy=True
-                )
-                u_t = torch.from_numpy(u).double()
-                input_activation, output_activation = record_activation_range(
-                    self.mes_net, self.forward_nets, u_t
-                )
-                break
+            if args.quantize:
+                self.quantize(args, dataset)
+        else:
+            cprint("IEKF nets NOT loaded", "yellow")
+
+    def quantize(self, args, dataset):
+        input_activation = {}
+        output_activation = {}
+
+        for i in range(0, len(dataset.datasets)):
+            dataset_name = dataset.dataset_name(i)
+            if dataset_name not in dataset.odometry_benchmark.keys():
+                continue
+            print("Recoding activation range on sequence: " + dataset_name)
+            _, _, _, _, u = prepare_data(args, dataset, dataset_name, i, to_numpy=True)
+            u_t = torch.from_numpy(u).double()
+            input_activation, output_activation = record_activation_range(
+                self.mes_net, self.forward_nets, u_t
+            )
+            break
+
+        if input_activation and output_activation:
             cprint("Activation range recorded", "green")
 
-            layers = quantize_weights(
-                [
-                    self.mes_net.cov_net[0],
-                    self.mes_net.cov_net[4],
-                    self.mes_net.cov_lin[0],
-                ]
+            conv_0 = QuantizedConv1d.build(
+                self.mes_net.cov_net[0],
+                "cov_net.0",
+                "cov_net.2",
+                input_activation,
+                output_activation,
+                pad_size=REPLICATION_PAD_SIZE,
             )
-            self.mes_net.cov_net[0] = QuantizedConv1d(
-                weight=layers[0][0],
-                bias=(
-                    self.mes_net.cov_net[0].bias.data.float()
-                    if self.mes_net.cov_net[0].bias is not None
-                    else None
-                ),
-                weight_scale=layers[0][1],
-                stride=self.mes_net.cov_net[0].stride,
-                padding=self.mes_net.cov_net[0].padding,
-                dilation=self.mes_net.cov_net[0].dilation,
-                groups=self.mes_net.cov_net[0].groups,
+            conv_4 = QuantizedConv1d.build(
+                self.mes_net.cov_net[4],
+                "cov_net.4",
+                "cov_net.6",
+                input_activation,
+                output_activation,
+                pad_size=REPLICATION_PAD_SIZE,
             )
-            self.mes_net.cov_net[4] = QuantizedConv1d(
-                weight=layers[1][0],
-                bias=(
-                    self.mes_net.cov_net[4].bias.data.float()
-                    if self.mes_net.cov_net[4].bias is not None
-                    else None
-                ),
-                weight_scale=layers[1][1],
-                stride=self.mes_net.cov_net[4].stride,
-                padding=self.mes_net.cov_net[4].padding,
-                dilation=self.mes_net.cov_net[4].dilation,
-                groups=self.mes_net.cov_net[4].groups,
+            linear_0 = QuantizedLinear.build(
+                self.mes_net.cov_lin[0],
+                "cov_lin.0",
+                input_activation,
+                output_activation,
             )
-            self.mes_net.cov_lin[0] = QuantizedLinear(
-                weight=layers[2][0],
-                bias=(
-                    self.mes_net.cov_lin[0].bias.data.float()
-                    if self.mes_net.cov_lin[0].bias is not None
-                    else None
-                ),
-                weight_scale=layers[2][1],
-            )
-            cprint("IEKF nets quantized", "green")
+
+            self.mes_net.cov_net = torch.nn.Sequential(conv_0, conv_4)
+            self.mes_net.cov_lin = torch.nn.Sequential(linear_0)  # TODO dequantize Tahn
+
             breakpoint()
+
+            cprint("IEKF nets quantized", "green")
         else:
-            cprint("IEKF nets NOT loaded", 'yellow')
+            cprint("Activation range NOT recorded", "yellow")
+            cprint("IEKF nets NOT quantized", "yellow")
 
 
 def isclose(mat1, mat2, tol=1e-10):
