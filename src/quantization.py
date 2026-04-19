@@ -91,6 +91,37 @@ def quantize_weights(layers, bitwidth=8):
     return quantized_layers
 
 
+def record_activation_range(model, sample_function, sample_data):
+    input_activation = {}
+    output_activation = {}
+
+    def add_range_recoder_hook(model):
+        import functools
+
+        def _record_range(self, x, y, module_name):
+            x = x[0]
+            input_activation[module_name] = x.detach()
+            output_activation[module_name] = y.detach()
+
+        all_hooks = []
+        for name, m in model.named_modules():
+            if isinstance(m, (nn.Conv1d, nn.Linear, nn.ReLU)):
+                all_hooks.append(
+                    m.register_forward_hook(
+                        functools.partial(_record_range, module_name=name)
+                    )
+                )
+        return all_hooks
+
+    hooks = add_range_recoder_hook(model)
+    sample_function(sample_data)
+
+    for h in hooks:
+        h.remove()
+
+    return input_activation, output_activation
+
+
 class QuantizedConv1d(nn.Module):
     def __init__(
         self,
@@ -114,7 +145,9 @@ class QuantizedConv1d(nn.Module):
         self.weight_bitwidth = weight_bitwidth
 
     def forward(self, x):
-        # TODO replace with int8 math
+        # TODO replace with int8 math, requires int8 bias
+        # int8 math performed first with int8 weight and bias,
+        # then floating point scale applied?
         weight_fp = self.weight.double() * self.weight_scale
         return nn.functional.conv1d(
             x,

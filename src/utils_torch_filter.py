@@ -7,7 +7,12 @@ from termcolor import cprint
 from utils_numpy_filter import NUMPYIEKF
 from utils import prepare_data
 
-from quantization import quantize_weights, QuantizedConv1d, QuantizedLinear
+from quantization import (
+    QuantizedConv1d,
+    QuantizedLinear,
+    quantize_weights,
+    record_activation_range,
+)
 
 class InitProcessCovNet(torch.nn.Module):
 
@@ -458,6 +463,7 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         self.Q[15:18, 15:18] = self.cov_t_c_i*beta[5]*self.Id3
 
     def load(self, args, dataset):
+        self.get_normalize_u(dataset)
         path_iekf = os.path.join(args.path_temp, "iekfnets.p")
         if os.path.isfile(path_iekf):
             mondict = torch.load(path_iekf)
@@ -473,6 +479,23 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
 
             self.load_state_dict(mondict, strict=False)
             cprint("IEKF nets loaded", 'green')
+
+            input_activation = {}
+            output_activation = {}
+            for i in range(0, len(dataset.datasets)):
+                dataset_name = dataset.dataset_name(i)
+                if dataset_name not in dataset.odometry_benchmark.keys():
+                    continue
+                print("Recoding activation range on sequence: " + dataset_name)
+                _, _, _, _, u = prepare_data(
+                    args, dataset, dataset_name, i, to_numpy=True
+                )
+                u_t = torch.from_numpy(u).double()
+                input_activation, output_activation = record_activation_range(
+                    self.mes_net, self.forward_nets, u_t
+                )
+                break
+            cprint("Activation range recorded", "green")
 
             layers = quantize_weights(
                 [
@@ -517,9 +540,9 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                 weight_scale=layers[2][1],
             )
             cprint("IEKF nets quantized", "green")
+            breakpoint()
         else:
             cprint("IEKF nets NOT loaded", 'yellow')
-        self.get_normalize_u(dataset)
 
 
 def isclose(mat1, mat2, tol=1e-10):
