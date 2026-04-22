@@ -438,15 +438,20 @@ def test_filter(args, dataset):
                                                        to_numpy=True)
         N = None
         u_t = torch.from_numpy(u).double()
+        quantn_start_time = time.time()
         measurements_covs = torch_iekf.forward_nets(u_t)
+        quantn_end_time = time.time()
+        print(f"Model Net Runtime: {quantn_end_time - quantn_start_time}s")
+
+
         measurements_covs = measurements_covs.detach().numpy()
         start_time = time.time()
         Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = iekf.run(t, u, measurements_covs,
                                                                    v_gt, p_gt, N,
                                                                    ang_gt[0])
         diff_time = time.time() - start_time
-        print("Execution time: {:.2f} s (sequence time: {:.2f} s)".format(diff_time,
-                                                                          t[-1] - t[0]))
+        # print("Execution time: {:.2f} s (sequence time: {:.2f} s)".format(diff_time,
+                                                                        #   t[-1] - t[0]))
         mondict = {
             't': t, 'Rot': Rot, 'v': v, 'p': p, 'b_omega': b_omega, 'b_acc': b_acc,
             'Rot_c_i': Rot_c_i, 't_c_i': t_c_i,
