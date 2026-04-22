@@ -7,10 +7,6 @@ from utils import *
 
 
 class NUMPYIEKF:
-    Id2 = np.eye(2)
-    Id3 = np.eye(3)
-    Id6 = np.eye(6)
-    IdP = np.eye(21)
 
     def __init__(self, parameter_class=None):
 
@@ -36,6 +32,14 @@ class NUMPYIEKF:
         self.n_normalize_rot_c_i = None
         self.P_dim = None
         self.verbose = None
+
+        # Identity matrices as instance attributes instead of class attributes
+        # so that subclasses (e.g. TORCHIEKF) can safely re-register them as
+        # nn.Module buffers without hitting "attribute already exists" errors.
+        self.Id2 = np.eye(2)
+        self.Id3 = np.eye(3)
+        self.Id6 = np.eye(6)
+        self.IdP = np.eye(21)
 
         # set the parameters
         if parameter_class is None:
@@ -256,7 +260,7 @@ class NUMPYIEKF:
         Rot_c_i_up = dR.dot(Rot_c_i)
         t_c_i_up = t_c_i + dx[18:21]
 
-        I_KH = NUMPYIEKF.IdP - K.dot(H)
+        I_KH = np.eye(21) - K.dot(H)
         P_up = I_KH.dot(P).dot(I_KH.T) + K.dot(R).dot(K.T)
         P_up = (P_up + P_up.T)/2
         return Rot_up, v_up, p_up, b_omega_up, b_acc_up, Rot_c_i_up, t_c_i_up, P_up
@@ -275,7 +279,7 @@ class NUMPYIEKF:
         v = np.cross(v1, v2)
         cosang = np.dot(v1, v2)
         sinang = np.linalg.norm(v)
-        Rot = NUMPYIEKF.Id3 + NUMPYIEKF.skew(v) + \
+        Rot = np.eye(3) + NUMPYIEKF.skew(v) + \
               NUMPYIEKF.skew(v).dot(NUMPYIEKF.skew(v))*(1-cosang)/(sinang**2)
         Rot = NUMPYIEKF.normalize_rot(Rot)
         return Rot
@@ -291,8 +295,8 @@ class NUMPYIEKF:
             skew_phi = np.array([[0, -phi[2], phi[1]],
                         [phi[2], 0, -phi[0]],
                         [-phi[1], phi[0], 0]])
-            J = NUMPYIEKF.Id3 + 0.5 * skew_phi
-            Rot = NUMPYIEKF.Id3 + skew_phi
+            J = np.eye(3) + 0.5 * skew_phi
+            Rot = np.eye(3) + skew_phi
         else:
             axis = phi / angle
             skew_axis = np.array([[0, -axis[2], axis[1]],
@@ -300,9 +304,9 @@ class NUMPYIEKF:
                         [-axis[1], axis[0], 0]])
             s = np.sin(angle)
             c = np.cos(angle)
-            J = (s / angle) * NUMPYIEKF.Id3 \
+            J = (s / angle) * np.eye(3) \
                    + (1 - s / angle) * np.outer(axis, axis) + ((1 - c) / angle) * skew_axis
-            Rot = c * NUMPYIEKF.Id3 + (1 - c) * np.outer(axis, axis) + s * skew_axis
+            Rot = c * np.eye(3) + (1 - c) * np.outer(axis, axis) + s * skew_axis
 
         x = J.dot(xi[3:].reshape(-1, 3).T)
         return Rot, x
@@ -325,7 +329,7 @@ class NUMPYIEKF:
         s = np.sin(angle)
         c = np.cos(angle)
 
-        return c * NUMPYIEKF.Id3 + (1 - c) * np.outer(axis, axis) + s * skew_axis
+        return c * np.eye(3) + (1 - c) * np.outer(axis, axis) + s * skew_axis
 
     @staticmethod
     def so3left_jacobian(phi):
@@ -342,7 +346,7 @@ class NUMPYIEKF:
             skew_phi = np.array([[0, -phi[2], phi[1]],
                       [phi[2], 0, -phi[0]],
                       [-phi[1], phi[0], 0]])
-            return NUMPYIEKF.Id3 + 0.5 * skew_phi
+            return np.eye(3) + 0.5 * skew_phi
 
         axis = phi / angle
         skew_axis = np.array([[0, -axis[2], axis[1]],
@@ -351,7 +355,7 @@ class NUMPYIEKF:
         s = np.sin(angle)
         c = np.cos(angle)
 
-        return (s / angle) * NUMPYIEKF.Id3 \
+        return (s / angle) * np.eye(3) \
                + (1 - s / angle) * np.outer(axis, axis) + ((1 - c) / angle) * skew_axis
 
     @staticmethod

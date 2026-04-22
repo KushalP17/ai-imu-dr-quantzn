@@ -200,7 +200,7 @@ def results_filter(args, dataset):
             fig_name = figs_name[l]
             fig.savefig(os.path.join(folder_path, fig_name + ".png"))
 
-        plt.show(block=True)
+        # plt.show(block=True)
 
 
 

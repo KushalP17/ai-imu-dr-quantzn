@@ -16,6 +16,12 @@ from quantization import (
 
 REPLICATION_PAD_SIZE = 4
 
+# ---------------------------------------------------------------------------
+# Global device: use CUDA if available, otherwise fall back to CPU.
+# All inference-time tensors and model parameters will be placed here.
+# ---------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class InitProcessCovNet(torch.nn.Module):
 
@@ -38,12 +44,18 @@ class InitProcessCovNet(torch.nn.Module):
             return
 
         def init_cov(self, iekf):
-            alpha = self.factor_initial_covariance(torch.ones(1).double()).squeeze()
+            # Create the constant input on the same device as the network weights
+            device = next(self.parameters()).device
+            alpha = self.factor_initial_covariance(
+                torch.ones(1, device=device).double()).squeeze()
             beta = 10**(self.tanh(alpha))
             return beta
 
         def init_processcov(self, iekf):
-            alpha = self.factor_process_covariance(torch.ones(1).double())
+            # Create the constant input on the same device as the network weights
+            device = next(self.parameters()).device
+            alpha = self.factor_process_covariance(
+                torch.ones(1, device=device).double())
             beta = 10**(self.tanh(alpha))
             return beta
 
@@ -71,55 +83,105 @@ class MesNet(torch.nn.Module):
             self.cov_lin[0].weight.data[:] /= 100
 
         def forward(self, u, iekf):
+            # beta_measurement and cov0_measurement must live on the same device
+            # as the input u. We move them lazily here so the forward pass works
+            # correctly regardless of which device u is on.
+            device = u.device
+            beta = self.beta_measurement.to(device)
             y_cov = self.cov_net(u).transpose(0, 2).squeeze()
             z_cov = self.cov_lin(y_cov)
-            z_cov_net = self.beta_measurement.unsqueeze(0)*z_cov
+            z_cov_net = beta.unsqueeze(0) * z_cov
             measurements_covs = (iekf.cov0_measurement.unsqueeze(0) * (10**z_cov_net))
             return measurements_covs
 
 
+def _safe_set_buffer(module, name, tensor):
+    """
+    Register `tensor` as an nn.Module buffer when the Module infrastructure is
+    fully initialised (i.e. `_buffers` exists on `module`), otherwise fall back
+    to a plain attribute assignment.
+
+    TORCHIEKF uses multiple inheritance (nn.Module + NUMPYIEKF).  The MRO means
+    NUMPYIEKF.__init__ and its call to set_param_attr execute before
+    torch.nn.Module.__init__ finishes, so `_buffers` does not exist on the very
+    first call.  Three cases are handled:
+
+      1. nn.Module not yet init'd  -> plain setattr (no _buffers dict yet)
+      2. Buffer already registered -> overwrite _buffers dict directly
+      3. Plain instance attr exists (leftover from case 1) -> delete it, then
+         call register_buffer so the tensor is properly tracked from this point on
+    """
+    if not hasattr(module, '_buffers'):
+        # nn.Module not yet initialised: plain assignment is all we can do.
+        setattr(module, name, tensor)
+    elif name in module._buffers:
+        # Already a registered buffer: overwrite value without re-registering.
+        module._buffers[name] = tensor
+    else:
+        # Remove any plain instance attribute of the same name (from case 1 above)
+        # before calling register_buffer, which would raise KeyError otherwise.
+        if name in module.__dict__:
+            del module.__dict__[name]
+        module.register_buffer(name, tensor)
+
+
 class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
-    Id1 = torch.eye(1).double()
-    Id2 = torch.eye(2).double()
-    Id3 = torch.eye(3).double()
-    Id6 = torch.eye(6).double()
-    IdP = torch.eye(21).double()
+    # NOTE: no class-level Id* tensor attributes here.
+    # They used to live as class attributes but that causes register_buffer to
+    # raise "attribute already exists" because PyTorch finds them on the class
+    # before finding them in _buffers.  They are now registered as instance
+    # buffers in __init__ via _safe_set_buffer so .to(device) moves them.
 
     def __init__(self, parameter_class=None):
+        # Initialise nn.Module FIRST so that _buffers exists when
+        # NUMPYIEKF.__init__ calls set_param_attr below.
         torch.nn.Module.__init__(self)
+        # NUMPYIEKF.__init__ calls set_param_attr() internally.  Because
+        # nn.Module is already initialised above, _safe_set_buffer will
+        # correctly register Q and cov0_measurement as proper buffers.
         NUMPYIEKF.__init__(self, parameter_class=None)
 
-        # mean and standard deviation of parameters for normalizing inputs
+        # mean and standard deviation of inputs for normalisation
         self.u_loc = None
         self.u_std = None
         self.initprocesscov_net = InitProcessCovNet()
         self.mes_net = MesNet()
-        self.cov0_measurement = None
 
-        # modified parameters
-        self.IdP = torch.eye(self.P_dim).double()
+        # Register identity matrices as buffers so .to(device) moves them.
+        # Use _safe_set_buffer because set_param_attr (called from
+        # NUMPYIEKF.__init__ above) may have already set some of these as
+        # plain instance attributes via the NUMPYIEKF class hierarchy.
+        _safe_set_buffer(self, 'Id1', torch.eye(1).double())
+        _safe_set_buffer(self, 'Id2', torch.eye(2).double())
+        _safe_set_buffer(self, 'Id3', torch.eye(3).double())
+        _safe_set_buffer(self, 'Id6', torch.eye(6).double())
+        _safe_set_buffer(self, 'IdP', torch.eye(21).double())
 
         if parameter_class is not None:
             self.filter_parameters = parameter_class()
             self.set_param_attr()
 
     def set_param_attr(self):
-        # get a list of attribute only
+        # Copy scalar parameters from filter_parameters onto self
         attr_list = [a for a in dir(self.filter_parameters) if not a.startswith('__')
                      and not callable(getattr(self.filter_parameters, a))]
         for attr in attr_list:
             setattr(self, attr, getattr(self.filter_parameters, attr))
 
-        self.Q = torch.diag(torch.Tensor([self.cov_omega, self.cov_omega, self. cov_omega,
-                                           self.cov_acc, self.cov_acc, self.cov_acc,
-                                           self.cov_b_omega, self.cov_b_omega, self.cov_b_omega,
-                                           self.cov_b_acc, self.cov_b_acc, self.cov_b_acc,
-                                           self.cov_Rot_c_i, self.cov_Rot_c_i, self.cov_Rot_c_i,
-                                           self.cov_t_c_i, self.cov_t_c_i, self.cov_t_c_i])
-                            ).double()
-        self.cov0_measurement = torch.Tensor([self.cov_lat, self.cov_up]).double()
+        Q = torch.diag(torch.Tensor([self.cov_omega, self.cov_omega, self.cov_omega,
+                                     self.cov_acc, self.cov_acc, self.cov_acc,
+                                     self.cov_b_omega, self.cov_b_omega, self.cov_b_omega,
+                                     self.cov_b_acc, self.cov_b_acc, self.cov_b_acc,
+                                     self.cov_Rot_c_i, self.cov_Rot_c_i, self.cov_Rot_c_i,
+                                     self.cov_t_c_i, self.cov_t_c_i, self.cov_t_c_i])
+                        ).double()
+        # Use the safe helper so this works both when called from NUMPYIEKF.__init__
+        # (before nn.Module.__init__) and when called later as a proper nn.Module.
+        _safe_set_buffer(self, 'Q', Q)
+        _safe_set_buffer(self, 'cov0_measurement',
+                         torch.Tensor([self.cov_lat, self.cov_up]).double())
 
-    def run(self, t, u,  measurements_covs, v_mes, p_mes, N, ang0):
+    def run(self, t, u, measurements_covs, v_mes, p_mes, N, ang0):
 
         dt = t[1:] - t[:-1]  # (s)
         Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P = self.init_run(dt, u, p_mes, v_mes,
@@ -154,7 +216,6 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         P[18:21, 18:21] = self.cov_t_c_i0*beta[5]*self.Id3
         return P
 
-
     def init_saved_state(self, dt, N, ang0):
         Rot = dt.new_zeros(N, 3, 3)
         v = dt.new_zeros(N, 3)
@@ -166,8 +227,8 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         Rot_c_i[0] = torch.eye(3).double()
         return Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i
 
-    def propagate(self, Rot_prev, v_prev, p_prev, b_omega_prev, b_acc_prev, Rot_c_i_prev, t_c_i_prev,
-                  P_prev, u, dt):
+    def propagate(self, Rot_prev, v_prev, p_prev, b_omega_prev, b_acc_prev, Rot_c_i_prev,
+                  t_c_i_prev, P_prev, u, dt):
         Rot_prev = Rot_prev.clone()
         acc_b = u[3:6] - b_acc_prev
         acc = Rot_prev.mv(acc_b) + self.g
@@ -186,8 +247,7 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                                u, dt)
         return Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P
 
-    def propagate_cov(self, P, Rot_prev, v_prev, p_prev, b_omega_prev, b_acc_prev, u,
-                      dt):
+    def propagate_cov(self, P, Rot_prev, v_prev, p_prev, b_omega_prev, b_acc_prev, u, dt):
 
         F = P.new_zeros(self.P_dim, self.P_dim)
         G = P.new_zeros(self.P_dim, self.Q.shape[0])
@@ -270,10 +330,12 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
 
     @staticmethod
     def skew(x):
-        X = torch.Tensor([[0, -x[2], x[1]],
-                          [x[2], 0, -x[0]],
-                          [-x[1], x[0], 0]]).double()
-        return X
+        # x.new_tensor ensures the result lives on the same device as x.
+        return x.new_tensor([
+            [ 0,    -x[2],  x[1]],
+            [ x[2],  0,    -x[0]],
+            [-x[1],  x[0],  0   ]
+        ])
 
     @staticmethod
     def rot_from_2_vectors(v1, v2):
@@ -294,16 +356,21 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
 
         # Near |phi|==0, use first order Taylor expansion
         if isclose(angle, 0.):
-            skew_phi = torch.Tensor([[0, -phi[2], phi[1]],
-                          [phi[2], 0, -phi[0]],
-                          [-phi[1], phi[0], 0]]).double()
+            # xi.new_tensor ensures skew matrices land on the same device as xi.
+            skew_phi = xi.new_tensor([
+                [ 0,      -phi[2],  phi[1]],
+                [ phi[2],  0,      -phi[0]],
+                [-phi[1],  phi[0],  0     ]
+            ])
             J = TORCHIEKF.Id3 + 0.5 * skew_phi
             Rot = TORCHIEKF.Id3 + skew_phi
         else:
             axis = phi / angle
-            skew_axis = torch.Tensor([[0, -axis[2], axis[1]],
-                              [axis[2], 0, -axis[0]],
-                              [-axis[1], axis[0], 0]]).double()
+            skew_axis = xi.new_tensor([
+                [ 0,       -axis[2],  axis[1]],
+                [ axis[2],  0,       -axis[0]],
+                [-axis[1],  axis[0],  0      ]
+            ])
             s = torch.sin(angle)
             c = torch.cos(angle)
 
@@ -321,15 +388,20 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
 
         # Near phi==0, use first order Taylor expansion
         if isclose(angle, 0.):
-            skew_phi = torch.Tensor([[0, -phi[2], phi[1]],
-                          [phi[2], 0, -phi[0]],
-                          [-phi[1], phi[0], 0]]).double()
+            # phi.new_tensor ensures the result is on the same device as phi.
+            skew_phi = phi.new_tensor([
+                [ 0,      -phi[2],  phi[1]],
+                [ phi[2],  0,      -phi[0]],
+                [-phi[1],  phi[0],  0     ]
+            ])
             Xi = TORCHIEKF.Id3 + skew_phi
             return Xi
         axis = phi / angle
-        skew_axis = torch.Tensor([[0, -axis[2], axis[1]],
-                          [axis[2], 0, -axis[0]],
-                          [-axis[1], axis[0], 0]]).double()
+        skew_axis = phi.new_tensor([
+            [ 0,       -axis[2],  axis[1]],
+            [ axis[2],  0,       -axis[0]],
+            [-axis[1],  axis[0],  0      ]
+        ])
         c = angle.cos()
         s = angle.sin()
         Xi = c * TORCHIEKF.Id3 + (1 - c) * TORCHIEKF.outer(axis, axis) \
@@ -347,20 +419,24 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
 
         # Near |phi|==0, use first order Taylor expansion
         if isclose(angle, 0.):
-            skew_phi = torch.Tensor([[0, -phi[2], phi[1]],
-                          [phi[2], 0, -phi[0]],
-                          [-phi[1], phi[0], 0]]).double()
+            skew_phi = phi.new_tensor([
+                [ 0,      -phi[2],  phi[1]],
+                [ phi[2],  0,      -phi[0]],
+                [-phi[1],  phi[0],  0     ]
+            ])
             return TORCHIEKF.Id3 + 0.5 * skew_phi
 
         axis = phi / angle
-        skew_axis = torch.Tensor([[0, -axis[2], axis[1]],
-                          [axis[2], 0, -axis[0]],
-                          [-axis[1], axis[0], 0]]).double()
+        skew_axis = phi.new_tensor([
+            [ 0,       -axis[2],  axis[1]],
+            [ axis[2],  0,       -axis[0]],
+            [-axis[1],  axis[0],  0      ]
+        ])
         s = torch.sin(angle)
         c = torch.cos(angle)
 
-        return (s / angle) * TORCHIEKF.Id3 + (1 - s / angle) * TORCHIEKF.outer(axis, axis)\
-               + ((1 - c) / angle) * skew_axis
+        return (s / angle) * TORCHIEKF.Id3 \
+               + (1 - s / angle) * TORCHIEKF.outer(axis, axis) + ((1 - c) / angle) * skew_axis
 
     @staticmethod
     def to_rpy(Rot):
@@ -383,46 +459,37 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
     @staticmethod
     def from_rpy(roll, pitch, yaw):
         """Form a rotation matrix from RPY Euler angles."""
-
         return TORCHIEKF.rotz(yaw).mm(TORCHIEKF.roty(pitch).mm(TORCHIEKF.rotx(roll)))
 
     @staticmethod
     def rotx(t):
         """Rotation about the x-axis."""
-
         c = torch.cos(t)
         s = torch.sin(t)
         return t.new([[1,  0,  0],
-                         [0,  c, -s],
-                         [0,  s,  c]])
+                      [0,  c, -s],
+                      [0,  s,  c]])
 
     @staticmethod
     def roty(t):
         """Rotation about the y-axis."""
-
         c = torch.cos(t)
         s = torch.sin(t)
         return t.new([[c,  0,  s],
-                         [0,  1,  0],
-                         [-s, 0,  c]])
+                      [0,  1,  0],
+                      [-s, 0,  c]])
 
     @staticmethod
     def rotz(t):
         """Rotation about the z-axis."""
-
         c = torch.cos(t)
         s = torch.sin(t)
         return t.new([[c, -s,  0],
-                         [s,  c,  0],
-                         [0,  0,  1]])
+                      [s,  c,  0],
+                      [0,  0,  1]])
 
     @staticmethod
     def normalize_rot(rot):
-        # U, S, V = torch.svd(A) returns the singular value
-        # decomposition of a real matrix A of size (n x m) such that A=USV′.
-        # Irrespective of the original strides, the returned matrix U will
-        # be transposed, i.e. with strides (1, n) instead of (n, 1).
-
         # pytorch SVD seems to be inaccurate, so just move to numpy immediately
         U, _, V = torch.svd(rot)
         S = torch.eye(3).double()
@@ -436,40 +503,45 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         return measurements_covs
 
     def normalize_u(self, u):
-        return (u-self.u_loc)/self.u_std
+        return (u - self.u_loc) / self.u_std
 
     def get_normalize_u(self, dataset):
-        self.u_loc = dataset.normalize_factors['u_loc'].double()
-        self.u_std = dataset.normalize_factors['u_std'].double()
+        # Always place u_loc / u_std on the same device as the model weights.
+        device = next(self.parameters()).device
+        self.u_loc = dataset.normalize_factors['u_loc'].double().to(device)
+        self.u_std = dataset.normalize_factors['u_std'].double().to(device)
 
     def set_Q(self):
-        """
-        Update the process noise covariance
-        :return:
-        """
+        """Update the process noise covariance."""
+        device = self.Id3.device
 
-        self.Q = torch.diag(torch.Tensor([self.cov_omega, self.cov_omega, self. cov_omega,
-                                           self.cov_acc, self.cov_acc, self.cov_acc,
-                                           self.cov_b_omega, self.cov_b_omega, self.cov_b_omega,
-                                           self.cov_b_acc, self.cov_b_acc, self.cov_b_acc,
-                                           self.cov_Rot_c_i, self.cov_Rot_c_i, self.cov_Rot_c_i,
-                                           self.cov_t_c_i, self.cov_t_c_i, self.cov_t_c_i])
-                            ).double()
+        Q_base = torch.diag(torch.Tensor([
+            self.cov_omega, self.cov_omega, self.cov_omega,
+            self.cov_acc, self.cov_acc, self.cov_acc,
+            self.cov_b_omega, self.cov_b_omega, self.cov_b_omega,
+            self.cov_b_acc, self.cov_b_acc, self.cov_b_acc,
+            self.cov_Rot_c_i, self.cov_Rot_c_i, self.cov_Rot_c_i,
+            self.cov_t_c_i, self.cov_t_c_i, self.cov_t_c_i,
+        ])).double().to(device)
+        _safe_set_buffer(self, 'Q', Q_base)
 
         beta = self.initprocesscov_net.init_processcov(self)
-        self.Q = torch.zeros(self.Q.shape[0], self.Q.shape[0]).double()
-        self.Q[:3, :3] = self.cov_omega*beta[0]*self.Id3
-        self.Q[3:6, 3:6] = self.cov_acc*beta[1]*self.Id3
-        self.Q[6:9, 6:9] = self.cov_b_omega*beta[2]*self.Id3
-        self.Q[9:12, 9:12] = self.cov_b_acc*beta[3]*self.Id3
-        self.Q[12:15, 12:15] = self.cov_Rot_c_i*beta[4]*self.Id3
-        self.Q[15:18, 15:18] = self.cov_t_c_i*beta[5]*self.Id3
+        Q_new = torch.zeros(self.Q.shape[0], self.Q.shape[0]).double().to(device)
+        Q_new[:3, :3] = self.cov_omega * beta[0] * self.Id3
+        Q_new[3:6, 3:6] = self.cov_acc * beta[1] * self.Id3
+        Q_new[6:9, 6:9] = self.cov_b_omega * beta[2] * self.Id3
+        Q_new[9:12, 9:12] = self.cov_b_acc * beta[3] * self.Id3
+        Q_new[12:15, 12:15] = self.cov_Rot_c_i * beta[4] * self.Id3
+        Q_new[15:18, 15:18] = self.cov_t_c_i * beta[5] * self.Id3
+        _safe_set_buffer(self, 'Q', Q_new)
 
     def load(self, args, dataset):
         self.get_normalize_u(dataset)
         path_iekf = os.path.join(args.path_temp, "iekfnets.p")
         if os.path.isfile(path_iekf):
-            mondict = torch.load(path_iekf)
+            # map_location=DEVICE loads weights directly onto the target device,
+            # avoiding an unnecessary CPU->GPU copy after the fact.
+            mondict = torch.load(path_iekf, map_location=DEVICE)
 
             w = mondict["mes_net.cov_net.4.weight"]
             b = mondict["mes_net.cov_net.4.bias"]
@@ -481,7 +553,17 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
             mondict["mes_net.cov_net.4.bias"] = b32.clone()
 
             self.load_state_dict(mondict, strict=False)
-            cprint("IEKF nets loaded", "green")
+
+            # Move the entire model (parameters + registered buffers) to DEVICE.
+            self.to(DEVICE)
+
+            # u_loc / u_std are plain tensors, not parameters/buffers, so we
+            # must move them manually after calling .to(DEVICE).
+            if self.u_loc is not None:
+                self.u_loc = self.u_loc.to(DEVICE)
+                self.u_std = self.u_std.to(DEVICE)
+
+            cprint("IEKF nets loaded onto {}".format(DEVICE), "green")
 
             if args.quantize:
                 self.quantize(args, dataset)
@@ -498,7 +580,7 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
                 continue
             print("Recoding activation range on sequence: " + dataset_name)
             _, _, _, _, u = prepare_data(args, dataset, dataset_name, i, to_numpy=True)
-            u_t = torch.from_numpy(u).double()
+            u_t = torch.from_numpy(u).double().to(DEVICE)
             input_activation, output_activation = record_activation_range(
                 self.mes_net, self.forward_nets, u_t
             )

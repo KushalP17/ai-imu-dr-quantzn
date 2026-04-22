@@ -13,7 +13,7 @@ from termcolor import cprint
 from navpy import lla2ned
 from collections import OrderedDict
 from dataset import BaseDataset
-from utils_torch_filter import TORCHIEKF
+from utils_torch_filter import TORCHIEKF, DEVICE
 from utils_numpy_filter import NUMPYIEKF as IEKF
 from utils import prepare_data
 from train_torch_filter import train_filter
@@ -170,7 +170,7 @@ class KITTIDataset(BaseDataset):
                 """
 
                 print("\n Sequence name : " + date_dir2)
-                if len(oxts) < KITTIDataset.min_seq_dim:  #  sequence shorter than 30 s are rejected
+                if len(oxts) < KITTIDataset.min_seq_dim:  #  sequence shorter than 30 s are rejected
                     cprint("Dataset is too short ({:.2f} s)".format(len(oxts) / 100), 'yellow')
                     continue
                 lat_oxts = np.zeros(len(oxts))
@@ -417,6 +417,8 @@ class KITTIDataset(BaseDataset):
 
 
 def test_filter(args, dataset):
+    cprint("Running inference on: {}".format(DEVICE), "cyan")
+
     iekf = IEKF()
     torch_iekf = TORCHIEKF()
 
@@ -426,8 +428,13 @@ def test_filter(args, dataset):
     torch_iekf.filter_parameters = KITTIParameters()
     torch_iekf.set_param_attr()
 
+    # load() already calls .to(DEVICE) internally, placing all weights and
+    # registered buffers on the GPU (or CPU if no GPU is available).
     torch_iekf.load(args, dataset)
     iekf.set_learned_covariance(torch_iekf)
+
+    # Switch to inference mode: disables Dropout and stops gradient tracking.
+    torch_iekf.eval()
 
     for i in range(0, len(dataset.datasets)):
         dataset_name = dataset.dataset_name(i)
@@ -437,14 +444,23 @@ def test_filter(args, dataset):
         t, ang_gt, p_gt, v_gt, u = prepare_data(args, dataset, dataset_name, i,
                                                        to_numpy=True)
         N = None
-        u_t = torch.from_numpy(u).double()
-        quantn_start_time = time.time()
-        measurements_covs = torch_iekf.forward_nets(u_t)
-        quantn_end_time = time.time()
+
+        # Move the IMU input tensor to the same device as the model.
+        u_t = torch.from_numpy(u).double().to(DEVICE)
+
+        # torch.no_grad() prevents building a computation graph during the
+        # forward pass, reducing memory usage and speeding up inference.
+        with torch.no_grad():
+            quantn_start_time = time.time()
+            measurements_covs = torch_iekf.forward_nets(u_t)
+            quantn_end_time = time.time()
+
         print(f"Model Net Runtime: {quantn_end_time - quantn_start_time}s")
 
+        # Pull the result back to CPU and convert to numpy before passing to
+        # NUMPYIEKF, which only understands numpy arrays.
+        measurements_covs = measurements_covs.cpu().detach().numpy()
 
-        measurements_covs = measurements_covs.detach().numpy()
         start_time = time.time()
         Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = iekf.run(t, u, measurements_covs,
                                                                    v_gt, p_gt, N,
