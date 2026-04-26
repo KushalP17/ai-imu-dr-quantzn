@@ -34,6 +34,8 @@ def launch(args):
     if args.results_filter:
         results_filter(args, dataset)
 
+    # export_state_dicts(args, dataset)
+
 
 class KITTIParameters(IEKF.Parameters):
     # gravity vector
@@ -482,6 +484,46 @@ class KITTIArgs():
         quantize = False
         dataset_class = KITTIDataset
         parameter_class = KITTIParameters
+
+def export_state_dicts(args, dataset):
+    import copy
+
+    results = {}
+
+    # ── Non-quantized ──────────────────────────────────────────────────────
+    torch_iekf_fp = TORCHIEKF()
+    torch_iekf_fp.filter_parameters = KITTIParameters()
+    torch_iekf_fp.set_param_attr()
+
+    # Temporarily disable quantize so load() gives us the raw FP32 weights
+    args_no_quant = copy.copy(args)
+    args_no_quant.quantize = False
+    torch_iekf_fp.load(args_no_quant, dataset)
+    torch_iekf_fp.eval()
+
+    results["full_model_fp32"]   = torch_iekf_fp.state_dict()
+    results["mes_net_fp32"]      = torch_iekf_fp.mes_net.state_dict()
+    results["initcov_net_fp32"]  = torch_iekf_fp.initprocesscov_net.state_dict()
+
+    # ── Quantized ──────────────────────────────────────────────────────────
+    if args.quantize:
+        torch_iekf_q = TORCHIEKF()
+        torch_iekf_q.filter_parameters = KITTIParameters()
+        torch_iekf_q.set_param_attr()
+        torch_iekf_q.load(args, dataset)   # quantize=True triggers quantize()
+        torch_iekf_q.eval()
+
+        results["full_model_quantized"]  = torch_iekf_q.state_dict()
+        results["mes_net_quantized"]     = torch_iekf_q.mes_net.state_dict()
+        results["initcov_net_quantized"] = torch_iekf_q.initprocesscov_net.state_dict()
+
+    # ── Save & print sizes ─────────────────────────────────────────────────
+    os.makedirs(args.path_results, exist_ok=True)
+    for name, sd in results.items():
+        path = os.path.join(args.path_results, f"{name}.pt")
+        torch.save(sd, path)
+        size_kb = os.path.getsize(path) / 1024
+        print(f"{name:35s}  {size_kb:8.1f} KB   →  {path}")
 
 
 if __name__ == '__main__':
